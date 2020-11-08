@@ -1,0 +1,667 @@
+#include <SPI.h>
+#include "nRF24L01.h"
+#include "RF24.h"
+#include "printf.h"
+#include <LiquidCrystal_PCF8574.h>
+#include <Wire.h>
+
+#define KEY    A3
+#define RED    A1
+#define GREEN  A0
+#define YELLOW 10
+
+// Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8
+RF24 radio(7, 8);
+
+// Topology
+const uint64_t pipes[2] = { 0xABCDABCD71LL, 0x544d52687CLL };              // Radio pipe addresses for the 2 nodes to communicate.
+
+// Role management: Set up role.  This sketch uses the same software for all the nodes
+// in this system.  Doing so greatly simplifies testing.
+
+typedef enum { role_nadajnik = 1, role_odbiornik } role_e;                 // The various roles supported by this sketch
+const char* role_friendly_name[] = { "invalid", "Nadajnik", "Odbiornik"};  // The debug-friendly names of those roles
+role_e role = role_odbiornik;                                              // The role of the current running sketch
+const short role_pin = 5;                 // sets the role of this unit in hardware.  Connect to GND to be the 'pong' receiver
+                                          // Leave open to be the 'ping' transmitter
+// A single byte to keep track of the data being sent back and forth
+byte counter = 1;
+
+LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars and 2 line display
+int show = -1;
+
+void setRED (void);
+void setGREEN(void);
+void clearRED (void);
+void clearGREEN(void);
+void setYELLOW(void);
+void clearYELLOW (void);
+
+// struktura danych do przesłania przez nRF24L01, do sterowania odbiornikiem
+struct dataStruct{  // do kopiowania i użytku wewnętrznego
+byte led;
+byte key;
+//int dane;
+unsigned int czas;
+}RxData;
+
+byte key_memory;
+byte led_memory;
+byte led_memory_odbiornik = 0;
+byte first_memory = 0;
+byte error = 0;
+
+void setup() {
+  int error;  // do LCD (i2c) - informuje, że jest LCD w systemie albo go nie ma
+  Serial.begin(115200);
+  printf_begin();
+  // definicja wyjść i wejść
+    /* Wejście na KEY i wyjścia na LED x 3  */
+  pinMode(A3,     INPUT_PULLUP);
+  
+  pinMode(RED,    OUTPUT);
+  pinMode(GREEN,  OUTPUT);
+  pinMode(YELLOW, OUTPUT);
+  /* Test diod */
+  digitalWrite(GREEN, HIGH);
+  digitalWrite(RED, HIGH);
+  digitalWrite(YELLOW, HIGH);
+
+
+  
+   /* Sprawdzenie, czy nadajnik czy odbiornik  */
+  pinMode(role_pin, INPUT);                        // set up the role pin                  
+  digitalWrite(role_pin,HIGH);                     // Change this to LOW/HIGH instead of using an external pin
+  delay(20);                                       // Just to get a solid reading on the role pin
+  if ( !digitalRead(role_pin) )                    // read the address pin, establish our role
+    role = role_nadajnik;   // nadajnik
+  else
+    role = role_odbiornik;  // odbiornik
+  // wyświetlenie, czy nadajnik czy odbiornik
+  Serial.print(F("\n\rRF24/examples/pingpair_ack/\n\rROLE: "));
+  Serial.println(role_friendly_name[role]);
+
+  /* Uruchomienie LCD */
+  Wire.begin();
+  Wire.beginTransmission(0x27);
+  error = Wire.endTransmission(); // Jeśli PCF'a nie ma lub jest ...
+  if (error == 0)
+  {
+    //show = 0;
+    lcd.clear();
+    lcd.begin(16, 2); // initialize the lcd
+    Serial.println("[INF]  LCD podlaczony i dziala");
+    lcd.setBacklight(1);
+    lcd.home();
+    lcd.clear();
+    // zapisanie drugiej linijki LCD
+      if (role == role_nadajnik)
+      {
+        //Serial.println("[INF] Nadajnik");
+        lcd.setCursor(0, 0);
+        lcd.print((role_friendly_name[role]));
+      }
+      else
+      {
+        //Serial.println("[INF] Odbiornik");
+        lcd.setCursor(0, 0);
+        lcd.print((role_friendly_name[role]));
+      }
+  }
+  else Serial.println("[ERR] Brak LCD...");
+
+  // Setup and configure rf radio
+  radio.begin();
+  radio.setAutoAck(1);                    // Ensure autoACK is enabled
+  radio.enableAckPayload();               // Allow optional ack payloads
+  radio.setRetries(0, 15);                // Smallest time between retries, max no. of retries
+  //radio.setPayloadSize(6);                // Here we are sending 1-byte payloads to test the call-response speed
+  radio.enableDynamicPayloads  ();
+  radio.openWritingPipe(pipes[1]);        // Both radios listen on the same pipes by default, and switch when writing
+  radio.openReadingPipe(1, pipes[0]);
+  radio.startListening();                 // Start listening
+  radio.printDetails();                   // Dump the configuration of the rf unit for debugging
+
+    if (role == role_nadajnik) {
+      Serial.println(F("*** SETTING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
+
+      role = role_nadajnik;                  // Become the primary transmitter (ping out)
+      radio.openWritingPipe(pipes[0]);
+      radio.openReadingPipe(1, pipes[1]);
+    } else if (role == role_odbiornik) {
+      Serial.println(F("*** SETTING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
+
+      role = role_odbiornik;                // Become the primary receiver (pong back)
+      radio.openWritingPipe(pipes[1]);
+      radio.openReadingPipe(1, pipes[0]);
+      radio.startListening();
+    }
+
+    Serial.println(sizeof(RxData));
+
+    // sprawdzenie stanu diod przy pierwszym włączeniu
+    clearRED(); clearGREEN();
+    // wysłanie pakietu z zapytaniem (RxData.led = 2)
+    RxData.led = 2;
+    first_memory = 0;
+    
+  if (role == role_nadajnik)
+  {
+    lcd.setCursor(0, 0); lcd.print("Remote rx check:");
+    delay (1000);
+  }
+  else
+  {
+    lcd.setCursor(0, 0); lcd.print("Odbiornik - restart");
+    lcd.setCursor(0, 1); lcd.print("--> green");
+    clearRED(); clearGREEN();
+    delay (1000);
+  }
+  lcd.clear();
+
+
+    
+}
+
+
+
+
+/* Pętla główna */
+
+void loop(void) {
+
+
+  
+  if (role == role_nadajnik) {
+    radio.stopListening();                                  // First, stop listening so we can talk.
+    byte gotByte;
+    unsigned long time = micros();                          // Take the time, and send it.  This will block until complete
+    RxData.czas = micros ();
+  
+  // sprawdzenie stanu diod na urządzeniu powinno być... (może na początku????)
+  // sprawdzenie stanu klawisza KEY
+  if (digitalRead(KEY) == 0 || first_memory == 0)
+  {
+    if (first_memory != 0) delay (20);  // eliminacja drgań zestyków ...
+    if (digitalRead(KEY) == 0 || first_memory == 0)
+    {
+      // wyświetlenie led_memory
+      lcd.setCursor(15, 1); lcd.print(led_memory); lcd.print(", "); lcd.print(first_memory);
+      // wciśnięto klawisz ...
+      key_memory = 1;           // ustaw znacznik, ze wciśnieto klawisz
+      // zmień diodę na przeciwną ...
+      if (led_memory == 1) {led_memory = 0; RxData.led = 0; setGREEN(); clearRED();}  // czerwona --> zielona
+        else {led_memory = 1; RxData.led = 1; setRED(); clearGREEN();}                // zielona --> czerwona
+  }
+
+  // wyświetlenie tego, co się chce uzyskac  małymi literami na LCD...
+  if (led_memory)
+  {
+    lcd.setCursor(0, 0); lcd.print("      ");
+    lcd.setCursor(0, 0); lcd.print("red!");
+    setRED(); clearGREEN();
+  }
+  else
+  {
+    lcd.setCursor(0, 0); lcd.print("     ");
+    lcd.setCursor(0, 0); lcd.print("green!");
+    setGREEN(); clearRED();
+  }
+  // wysyłka
+  if (first_memory == 0) RxData.led = 2;
+  else RxData.led = led_memory;
+  printf("\n\r[%d][%d][%d]",RxData.led, RxData.key, RxData.czas);
+  if (!radio.write(&RxData, sizeof(RxData))) 
+  {
+    Serial.println(F("failed."));
+    lcd.setCursor(10, 1); lcd.print("ERR");
+    //error = 1;
+  } 
+  else 
+  {
+    if (!radio.available()) 
+    {
+      Serial.println(F("Blank Payload Received."));
+    } 
+    else 
+    {
+      while (radio.available()) 
+      {
+        //error = 0;
+        //lcd.setCursor(10, 1); lcd.print("     ");
+        unsigned long tim = micros();
+        if (first_memory == 0) first_memory = 1;  // odczytano status odbiornika
+        radio.read(&RxData, sizeof(RxData));      // odczytanie danych z bufora
+        printf("\n\r(%d)(%d)(%d)** \n\r\n\r",RxData.led, RxData.key, RxData.czas);  // wyświetlenie odpowiedzi z odbiornika (ACK)
+        // sprawdzenie stanu diod po zwrotce...
+        printf("\n\r*[%d][%d]",led_memory, RxData.led);
+        led_memory = RxData.led;
+        printf("\n\r*[%d][%d]",led_memory, RxData.led);
+        if (RxData.led == 1)
+        {
+          lcd.setCursor(0, 0); lcd.print("      ");
+          lcd.setCursor(0, 0); lcd.print("RED.");
+          setRED(); clearGREEN();
+        }
+        if (RxData.led == 0)
+        {
+          lcd.setCursor(0, 0); lcd.print("     ");
+          lcd.setCursor(0, 0); lcd.print("GREEN.");
+          setGREEN(); clearRED();
+        }
+        if (RxData.led == 2)
+        {
+          lcd.setCursor(0, 0); lcd.print("     ");
+          lcd.setCursor(0, 0); lcd.print("LED OFF.");
+          clearGREEN(); clearRED(); setYELLOW();
+        }
+        counter++;
+      }
+    }
+  }
+  while(digitalRead(KEY) == 0) delay(50);
+  if (first_memory == 0) delay (300);
+  }
+  }
+
+  // Pong back role.  Receive each packet, dump it out, and send it back
+
+
+  if (role == role_odbiornik) {
+    byte pipeNo;
+    byte gotByte;                                       // Dump the payloads until we've gotten everything
+    while (radio.available(&pipeNo)) {
+    radio.read(&RxData, sizeof(RxData));
+      if (RxData.led == 2)        // sprawdzanie urządzenia...
+      {
+        RxData.led = led_memory_odbiornik;        
+      }
+      else led_memory_odbiornik = RxData.led;
+      //printf("\n\r[%d][%d][%d]",RxData.led, RxData.key, RxData.czas);
+      //RxData.led= RxData.led - 3;
+      radio.writeAckPayload(pipeNo, &RxData, 4);//sizeof(RxData));
+      //Serial.print(F("Received message and replied at "));
+      printf("Received message [%d,%d] and replied at ", RxData.led, RxData.key);
+      Serial.println(millis());
+          lcd.setCursor(0, 1); lcd.print("     ");
+          lcd.setCursor(0, 1); lcd.print(RxData.led); lcd.print(", "); lcd.print(RxData.key);
+
+          // wyświetlenie stanu diod
+          if (led_memory_odbiornik==1)
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("RED");
+            
+            setRED(); clearGREEN();
+          }
+          else
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("GREEN");
+            setGREEN(); clearRED();
+          }
+    }
+  }
+
+//  // Change roles
+//
+//  if (Serial.available()) {
+//    char c = toupper(Serial.read());
+//    if (c == 'T' && role == role_odbiornik) {
+//      Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
+//
+//      role = role_nadajnik;                  // Become the primary transmitter (ping out)
+//      radio.openWritingPipe(pipes[0]);
+//      radio.openReadingPipe(1, pipes[1]);
+//    } else if (c == 'R' && role == role_nadajnik) {
+//      Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
+//
+//      role = role_odbiornik;                // Become the primary receiver (pong back)
+//      radio.openWritingPipe(pipes[1]);
+//      radio.openReadingPipe(1, pipes[0]);
+//      radio.startListening();
+//    }
+//  }
+}
+
+
+void setRED (void)    {digitalWrite(RED,    HIGH);  }
+void setGREEN(void)   {digitalWrite(GREEN,  HIGH);  }
+void clearRED (void)  {digitalWrite(RED,    LOW);   }
+void clearGREEN(void) {digitalWrite(GREEN,  LOW);   }
+void setYELLOW (void)  {digitalWrite(YELLOW,    HIGH);   }
+void clearYELLOW(void) {digitalWrite(YELLOW,  LOW);   }
+
+
+// ------------------------------------------------------------------------------ END v1 (26 września)
+
+
+
+
+
+
+
+#include <SPI.h>
+#include "nRF24L01.h"
+#include "RF24.h"
+#include "printf.h"
+#include <LiquidCrystal_PCF8574.h>
+#include <Wire.h>
+
+#define KEY    A3
+#define RED    A1
+#define GREEN  A0
+#define YELLOW 10
+
+// Hardware configuration: Set up nRF24L01 radio on SPI bus plus pins 7 & 8
+RF24 radio(7, 8);
+
+// Topology
+const uint64_t pipes[2] = { 0xABCDABCD71LL, 0x544d52687CLL };              // Radio pipe addresses for the 2 nodes to communicate.
+
+// Role management: Set up role.  This sketch uses the same software for all the nodes
+// in this system.  Doing so greatly simplifies testing.
+
+typedef enum { role_nadajnik = 1, role_odbiornik } role_e;                 // The various roles supported by this sketch
+const char* role_friendly_name[] = { "invalid", "Nadajnik", "Odbiornik"};  // The debug-friendly names of those roles
+role_e role = role_odbiornik;                                              // The role of the current running sketch
+const short role_pin = 5;                 // sets the role of this unit in hardware.  Connect to GND to be the 'pong' receiver
+                                          // Leave open to be the 'ping' transmitter
+// A single byte to keep track of the data being sent back and forth
+byte counter = 1;
+
+LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars and 2 line display
+int show = -1;
+
+void setRED (void);
+void setGREEN(void);
+void clearRED (void);
+void clearGREEN(void);
+
+// struktura danych do przesłania przez nRF24L01, do sterowania odbiornikiem
+struct dataStruct{  // do kopiowania i użytku wewnętrznego
+byte led;
+byte key;
+//int dane;
+unsigned int czas;
+}RxData;
+
+byte key_memory;
+byte led_memory;
+byte led_memory_odbiornik = 0;
+byte first_memory = 0;
+
+void setup() {
+  int error;  // do LCD (i2c) - informuje, że jest LCD w systemie albo go nie ma
+  Serial.begin(115200);
+  printf_begin();
+  // definicja wyjść i wejść
+    /* Wejście na KEY i wyjścia na LED x 3  */
+  pinMode(A3,     INPUT_PULLUP);
+ 
+  pinMode(RED,    OUTPUT);
+  pinMode(GREEN,  OUTPUT);
+  pinMode(YELLOW, OUTPUT);
+  /* Test diod */
+  digitalWrite(GREEN, HIGH);
+  digitalWrite(RED, HIGH);
+  digitalWrite(YELLOW, HIGH);
+
+
+ 
+   /* Sprawdzenie, czy nadajnik czy odbiornik  */
+  pinMode(role_pin, INPUT);                        // set up the role pin                  
+  digitalWrite(role_pin,HIGH);                     // Change this to LOW/HIGH instead of using an external pin
+  delay(20);                                       // Just to get a solid reading on the role pin
+  if ( !digitalRead(role_pin) )                    // read the address pin, establish our role
+    role = role_nadajnik;   // nadajnik
+  else
+    role = role_odbiornik;  // odbiornik
+  // wyświetlenie, czy nadajnik czy odbiornik
+  Serial.print(F("\n\rRF24/examples/pingpair_ack/\n\rROLE: "));
+  Serial.println(role_friendly_name[role]);
+
+  /* Uruchomienie LCD */
+  Wire.begin();
+  Wire.beginTransmission(0x27);
+  error = Wire.endTransmission(); // Jeśli PCF'a nie ma lub jest ...
+  if (error == 0)
+  {
+    //show = 0;
+    lcd.clear();
+    lcd.begin(16, 2); // initialize the lcd
+    Serial.println("[INF]  LCD podlaczony i dziala");
+    lcd.setBacklight(1);
+    lcd.home();
+    lcd.clear();
+    // zapisanie drugiej linijki LCD
+      if (role == role_nadajnik)
+      {
+        //Serial.println("[INF] Nadajnik");
+        lcd.setCursor(0, 0);
+        lcd.print((role_friendly_name[role]));
+      }
+      else
+      {
+        //Serial.println("[INF] Odbiornik");
+        lcd.setCursor(0, 0);
+        lcd.print((role_friendly_name[role]));
+      }
+  }
+  else Serial.println("[ERR] Brak LCD...");
+
+  // Setup and configure rf radio
+  radio.begin();
+  radio.setAutoAck(1);                    // Ensure autoACK is enabled
+  radio.enableAckPayload();               // Allow optional ack payloads
+  radio.setRetries(0, 15);                // Smallest time between retries, max no. of retries
+  //radio.setPayloadSize(6);                // Here we are sending 1-byte payloads to test the call-response speed
+  radio.enableDynamicPayloads  ();
+  radio.openWritingPipe(pipes[1]);        // Both radios listen on the same pipes by default, and switch when writing
+  radio.openReadingPipe(1, pipes[0]);
+  radio.startListening();                 // Start listening
+  radio.printDetails();                   // Dump the configuration of the rf unit for debugging
+
+    if (role == role_nadajnik) {
+      Serial.println(F("*** SETTING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
+
+      role = role_nadajnik;                  // Become the primary transmitter (ping out)
+      radio.openWritingPipe(pipes[0]);
+      radio.openReadingPipe(1, pipes[1]);
+    } else if (role == role_odbiornik) {
+      Serial.println(F("*** SETTING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
+
+      role = role_odbiornik;                // Become the primary receiver (pong back)
+      radio.openWritingPipe(pipes[1]);
+      radio.openReadingPipe(1, pipes[0]);
+      radio.startListening();
+    }
+
+    Serial.println(sizeof(RxData));
+
+    // sprawdzenie stanu diod przy pierwszym włączeniu
+    clearRED(); clearGREEN();
+    // wysłanie pakietu z zapytaniem (RxData.led = 2)
+    RxData.led = 2;
+    first_memory = 0;
+    
+
+
+
+    
+    
+}
+
+
+
+
+/* Pętla główna */
+
+void loop(void) {
+
+  byte led = 0; // 0 - GREEN, 1 - RED
+
+  //RxData.led = 5;//counter;
+  //RxData.key = 9;
+  //RxData.dane = 0;
+  //RxData.czas = micros ();
+
+ 
+  if (role == role_nadajnik) {
+    radio.stopListening();                                  // First, stop listening so we can talk.
+//counter++;
+//RxData.led = counter;
+    //printf("Now sending %d as payload. ", counter);
+    byte gotByte;
+    unsigned long time = micros();                          // Take the time, and send it.  This will block until complete
+    //Called when STANDBY-I mode is engaged (User is finished sending)
+    //if (!radio.write(&counter, 1)) {
+    RxData.czas = micros ();
+// sprawdzenie stanu diod na urządzeniu powinno być... (może na początku????)
+
+// sprawdzenie stanu klawisza KEY
+if (digitalRead(KEY) == 0 || first_memory == 0)
+{
+  delay (20);
+  if (digitalRead(KEY) == 0 || first_memory == 0)
+  {
+    // wciśnięto klawisz ...
+    key_memory = 1;           // ustaw znacznik, ze wciśnieto klawisz
+    // zmień diodę na przeciwną ...
+    if (led_memory == 1) {led_memory = 0; RxData.led = 0; setGREEN(); clearRED();}  // czerwona --> zielona
+      else {led_memory = 1; RxData.led = 1; setRED(); clearGREEN();}                // zielona --> czerwona
+  }
+// ustawienie odpowiedniego stanu diody LED do wysyłki
+if (first_memory != 0) RxData.led = led_memory;
+else RxData.led = 2;
+      printf("\n\r[%d][%d][%d]",RxData.led, RxData.key, RxData.czas);
+// wyświetlenie tego, co się chce uzyskac  małymi literami na LCD...
+          if (led_memory)
+          {
+            lcd.setCursor(10, 0); lcd.print("      ");
+            lcd.setCursor(10, 0); lcd.print("red!");
+            setRED(); clearGREEN();
+          }
+          else
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("green!");
+            setGREEN(); clearRED();
+          }
+// wysyłka
+if (first_memory == 0) RxData.led = 2;
+    if (!radio.write(&RxData, sizeof(RxData))) {
+      Serial.println(F("failed."));
+      
+    } else {
+      if (!radio.available()) {
+        Serial.println(F("Blank Payload Received."));
+          
+          lcd.setCursor(10, 1); lcd.print("blank");
+      } else {
+        while (radio.available()) {
+          unsigned long tim = micros();
+          //radio.read(&gotByte, 1);
+          if (first_memory == 0) {first_memory = 1; }//lcd.setCursor(17, 1); lcd.print("OK");}
+          radio.read(&RxData, sizeof(RxData));
+                printf("\n\r(%d)(%d)(%d)** \n\r\n\r",RxData.led, RxData.key, RxData.czas);
+          //printf("Got response %d, round-trip delay: %lu microseconds\n\r", gotByte, tim - time);
+          //printf("Got response %d, round-trip delay: %lu microseconds\n\r", RxData.led, RxData.czas - time);
+          // wyświetlenie czasu powrotu pakietu
+          //lcd.setCursor(10, 1); lcd.print("     ");
+          //lcd.setCursor(0, 1); lcd.print("     ");
+          //lcd.setCursor(0, 1); lcd.print(RxData.czas - time);
+// sprawdzenie stanu diod po zwrotce...
+          if (RxData.led == 1)
+          {
+            lcd.setCursor(10, 0); lcd.print("      ");
+            lcd.setCursor(10, 0); lcd.print("RED.");
+            setRED(); clearGREEN();
+          }
+          if (RxData.led == 0)
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("GREEN.");
+            setGREEN(); clearRED();
+          }
+
+
+          counter++;
+        }
+      }
+    }
+    // Try again later
+    //delay(1000);
+    while(digitalRead(KEY) == 0) delay(50);
+  }
+  }
+
+  // Pong back role.  Receive each packet, dump it out, and send it back
+
+
+  if (role == role_odbiornik) {
+    byte pipeNo;
+    byte gotByte;                                       // Dump the payloads until we've gotten everything
+    while (radio.available(&pipeNo)) {
+      //radio.read(&gotByte, 1);
+      //radio.writeAckPayload(pipeNo, &gotByte, 1);
+      radio.read(&RxData, sizeof(RxData));
+      if (RxData.led == 2)        // sprawdzanie urządzenia...
+      {
+        RxData.led = led_memory_odbiornik;        
+      }
+      else led_memory_odbiornik = RxData.led;
+      //printf("\n\r[%d][%d][%d]",RxData.led, RxData.key, RxData.czas);
+      //RxData.led= RxData.led - 3;
+      radio.writeAckPayload(pipeNo, &RxData, 4);//sizeof(RxData));
+      //Serial.print(F("Received message and replied at "));
+      printf("Received message [%d,%d] and replied at ", RxData.led, RxData.key);
+      Serial.println(millis());
+          lcd.setCursor(0, 1); lcd.print("     ");
+          lcd.setCursor(0, 1); lcd.print(RxData.led); lcd.print(", "); lcd.print(RxData.key);
+
+          // wyświetlenie stanu diod
+          if (led_memory_odbiornik==1)
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("RED");
+            
+            setRED(); clearGREEN();
+          }
+          else
+          {
+            lcd.setCursor(10, 0); lcd.print("     ");
+            lcd.setCursor(10, 0); lcd.print("GREEN");
+            setGREEN(); clearRED();
+          }
+    }
+  }
+
+//  // Change roles
+//
+//  if (Serial.available()) {
+//    char c = toupper(Serial.read());
+//    if (c == 'T' && role == role_odbiornik) {
+//      Serial.println(F("*** CHANGING TO TRANSMIT ROLE -- PRESS 'R' TO SWITCH BACK"));
+//
+//      role = role_nadajnik;                  // Become the primary transmitter (ping out)
+//      radio.openWritingPipe(pipes[0]);
+//      radio.openReadingPipe(1, pipes[1]);
+//    } else if (c == 'R' && role == role_nadajnik) {
+//      Serial.println(F("*** CHANGING TO RECEIVE ROLE -- PRESS 'T' TO SWITCH BACK"));
+//
+//      role = role_odbiornik;                // Become the primary receiver (pong back)
+//      radio.openWritingPipe(pipes[1]);
+//      radio.openReadingPipe(1, pipes[0]);
+//      radio.startListening();
+//    }
+//  }
+}
+
+
+void setRED (void) {digitalWrite(RED, HIGH);}
+void setGREEN(void) {digitalWrite(GREEN, HIGH);}
+void clearRED (void){digitalWrite(RED, LOW);}
+void clearGREEN(void) {digitalWrite(GREEN, LOW);} 
+
+
